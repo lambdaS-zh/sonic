@@ -2,6 +2,55 @@
 
 ---
 
+## v0.1.8 (2026-08-23)
+
+### 新增功能 — HTTP Range 分片（206）录制/回放完整方案（v2.1/v2.2/v2.3 三阶段实施）
+
+**背景**：Web 应用（尤其 emulator 类 H5 游戏，如 PS 模拟器）为提高加载速度，多线程从多个 CDN 域名随机分片下载大文件（206 Partial Content）。此前同一 URL 的多条 206 分片互相覆盖只留一条（"保留 body 最大"是有损简化），回放侧完全不读 Range 头——分片资源回放失败或只命中部分数据。经方案讨论（2026-08-22 定稿）后三阶段实施落地。
+
+#### v2.1 主实施 — 全量探测 + 四元组精确匹配
+
+1. **存储模型扩展**：`resources` 表去掉 `(url, method)` 唯一索引 → 重建同名非唯一索引；新增列 `range_start`、`range_end`、`total_size`、`entity_key`；206 分片按 `(url, method, range_start)` 定位（同起点覆盖更新、不同起点共存），URL→实体多对一由表本身建立
+2. **实体识别锚点**：ETag（权威锚点）+ TOTAL（Content-Range total，必选辅助）双判据，Last-Modified 出现时要求一致、缺席放行；无 ETag 不自动识别（fail-safe：宁可漏识别，不可误并）
+3. **探测式全量请求**：实体首个 206 分片完成、解析出 ETag 后，立即用相同请求头剔除 `Range`/`If-Range` 补发全量 GET（不等到录制结束，避免 UAF/覆盖竞争/时点不可靠三重竞态）；走独立 HTTP 客户端（`QNetworkAccessManager`），不经过页面 Fetch 域（避免 CORS 与二次录制）；同一 ETag 只探测一次
+4. **响应校验**：必须 `200` 且无 `Content-Range`；`206`/`416`/`304` 视为失败放弃，该 URL 维持 206 分片记录走现状路径
+5. **写入优先级按状态码**：同 URL 已有 200 完整记录时 206 不得覆盖——顺带修复旧"大小单向覆盖"问题；回调先检查录制状态，已停止则丢弃结果
+6. **停止时 in-flight 询问**：`stop()` 若仍有在途探测，弹窗询问且仅两选项「立即停止」（丢弃探测结果）/「取消」（继续录制），不做异步等待，选择权完全在用户
+7. **回放残片四元组精确匹配**：新增 `getResource(url, method, rangeStart, rangeEnd, out)`——完整记录（`range_start IS NULL`）优先 → 四元组精确匹配残片 → 无匹配返回失败（fail-safe）；开区间 `bytes=a-` 放宽 `range_end`；V1 legacy 自动退化无约束查询
+8. **策略域与 range 正交**：策略匹配域恒为 `(url, method)`，range 仅透传数据定位层；禁止给策略增加 range 条件（防止数据存储细节泄漏进用户策略配置）
+9. **URL 变化识别边界**：探测成功的完整资源只挂在录制时出现的 URL 下；回放时 URL 变化（`1.zip` → `2.zip`）不能自动按 ETag/entity 识别，必须靠用户策略（UrlTemplate/FuzzyMatch）映射
+
+#### v2.2 增强
+
+1. **同 ETag 多 URL 自动识别（竞态修复）**：`m_entityUrls` 登记上移至去重早退之前——探测 in-flight 期间到达的同 ETag 206 URL 也在探测完成时统一补挂完整记录；探测完成后的新 URL 由既有补挂路径处理。结论：同 ETag 即同实体，Creator 自动处理，无需用户策略
+2. **body.link 软引用（物化去重）**：物化同实体多 URL 时首个 URL 写真实 body 并记录记录 ID，后续 URL 写 `bodies/{id:08d}.body.link`（纯文本引用，内容为目标 body 记录 ID），避免大文件重复存储；读取侧先试 `.body`、无则解析 `.link` 级联读目标；单层引用防链式/环、悬空引用 fail-safe
+3. **chromium_version 元数据**：录制时经 `ICoreWebView2Environment::get_BrowserVersionString` 获取内核版本写入包元数据（诊断录制/回放内核差异用）
+
+#### v2.3 可用性完善（in-flight 感知 + 兜底，路径 A 四项）
+
+1. **ProbeEntry 探测条目跟踪**：`m_activeProbes`（QList\<ProbeEntry\>）替代原 `m_probeInflightCount` 计数，每项含 reply/URL/etagKey/sentHeaders/startedAt/totalBytes/receivedBytes/watchdog；`removeProbeEntry` 在 reply finished 时统一收尾（停看门狗、更新计数、通知 UI）——看门狗/停止弹窗/状态栏/失败归因共用单一数据源
+2. **无进展看门狗（替代固定超时）**：每个探测一个单次 `QTimer`（15s 零字节阈值），`downloadProgress` 有数据即重启——传输中永不限时（大文件慢速下载零影响），仅"N 秒零字节"的死连接（黑洞挂死）触发 `reply->abort()` 走既有失败路径（保留 206 分片）。与 curl `--speed-limit`/`--speed-time` 同机制；**绝不用** `setTransferTimeout` 固定总时长（会误杀恰好 31s 下载完的大文件）
+3. **停止弹窗增强（知情决策）**：弹窗直接列出每个 in-flight 的 `[已等 Ns] URL — 已下载/总量`（URL 截断 60 字符，超 8 条折叠「… 还有 N 个」）；主文本补充最长等待秒数与"状态栏「分片补全」归零后再停止"引导——「立即停止/取消」从盲选变为知情决策
+4. **状态栏「分片补全 N」实时指示**：新增 `m_probeLabel`（暗金色、默认隐藏），`probeInflightChanged` 驱动显示/隐藏，归零自动消失——实时感知后台探测，而非停止时才发现
+5. **探测失败可见化（回放需手动配置提示）**：失败归因——`reply->error() != NoError` → 网络层（无进展超时/断连/DNS），有 Content-Range 的 206 或 `status != 200` → HTTP 层；emit `probeFailed(url, reason)` → 状态栏即时提示 + 监视窗口登记失败条目 + 停止时汇总进"录制完成"摘要，不再静默退回分片数据
+
+### 兼容性
+
+- `SWSWSONIC_FORMAT_VERSION` **纯整数化**并升至 `22`（v2.2，`body.link` 软引用存储格式）；新 Player 打开旧包做**列探测 + 迁移**（缺列 `ALTER TABLE ADD COLUMN`、重建非唯一索引）；旧记录 range 列均为 NULL，回放行为与现状完全一致，Range 语义只对新记录生效
+- 修复 `ver.toDouble()` 版本比较语义 bug（`"2.10"` 被转成 `2.1`）：改为纯整数比较（`toInt`，非数字视为 0），保留空版本宽容打开语义（`!ver.isEmpty()` 不拒绝）
+
+### 已知边界（明确不做）
+
+- 不做运行时组装（回放期动态等价类）；回放侧不实现 Range 切片语义，探测失败时按 `(url, method, range_start, range_end)` 四元组精确返回对应分片，无匹配则失败（fail-safe）
+- 认证资源（需登录/签名）探测可能 401/403，退回仅分片记录路径（已知局限）
+- URL 完全随机、无 ETag 的资源无法自动识别（信息论盲区），依赖人工兜底
+
+### 备用方案（已记入 ROADMAP 未来计划）
+
+- **录制侧分片合并与空洞探测**：若 PS 模拟器实测发现服务器故意不响应全量探测请求（416/304/挂起/防盗链）时启动讨论；若实测无问题则维持全量探测现状，该条目长期挂起。启动前必做只读"停止时空洞检测报告"验证空洞频率
+
+---
+
 ## v0.1.7 (2026-08-14)
 
 ### 修复问题
