@@ -2,6 +2,22 @@
 
 ---
 
+## v0.1.9 (2026-09-01)
+
+### 修复问题 — 分片补全链路的数据完整性与视图失真（v2.4）
+
+**背景**：castlevaniaX-ps 实测案例（340MB ROM 从 17 个 CDN 镜像 URL 并发分片下载）暴露三个问题：① 探测补挂完整记录时 `DELETE` 分片记录但 2MB body 文件未回收，留下 ~154 个孤儿文件（≈308MB）；② `putResource` 的"删除分片 + 插入完整记录"无事务包裹，`DELETE` 成功而 `INSERT` 失败会产生"记录被删且无替代"的空档；③ 监视面板是内存快照，补全后旧 206 幽灵条目仍显示（面板 3 条 vs DB 2 条），用户会误判资源形态。经讨论定稿（方案：录制结束扫描兜底 + 事务包裹 + 补全标记，误并风险维持双判据现状）后实施。
+
+1. **孤儿 body 文件清理（录制结束扫描，方案 B）**：新增 `SwsonicFormat::cleanupOrphanBodies()`——扫描 `bodies/` 目录，删除 DB 中无对应记录的文件（`*.body` / `*.body.link`，文件名剥离后缀后按完整 id 解析，避免 `left(8)` 截断误判超长 id）。判定安全边界：`.body.link` 引用目标的记录必然在表中，不会误删；仅 `DirBackend` 生效（Zip 只读且 body 在 ZIP 内）。`NetworkRecorder::doStop()` 在剩余 pending 全部落库后调用（避免误删 in-flight 未写 DB 的文件）
+2. **`putResource` 事务包裹（方案 A）**：V2 写路径用 `QSqlDatabase::transaction()` 包裹——"删除残留分片 + 插入/更新完整记录"原子化，任一 SQL 失败 `rollback()` 恢复被删记录，堵死"策略指向空记录"的唯一真实入口。body 外部文件不参与事务（先落库后写文件，body 写入失败只告警不回滚记录，保持既有语义）
+3. **监视面板补全标记（方案 A）**：新增 `NetworkRecorder::resourceCompleted(url, method)` 信号（探测记录写入后发出），`NetworkInspector::markCompleted(url, method)` 把匹配的旧 206 条目标记为 `206→200` 并追加 `[已补全]`、整行置灰——消除幽灵分片条目造成的视图失真；批量模式（`loadFromSwsonic`）数据源自 DB 天然无幽灵，不处理
+
+### 已知边界（维持现状）
+
+- 同 ETag 误并风险维持双判据（ETag + Content-Range total）+ fail-safe 现状，不做逐 URL 复核（会从"探测 1 次"退化为"17 次"，削弱 v2.1 设计收益），不写入文档
+
+---
+
 ## v0.1.8 (2026-08-23)
 
 ### 新增功能 — HTTP Range 分片（206）录制/回放完整方案（v2.1/v2.2/v2.3 三阶段实施）
