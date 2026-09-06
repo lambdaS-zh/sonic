@@ -2,6 +2,44 @@
 
 ---
 
+## v0.1.10 (2026-09-06)
+
+### 改进 — Creator 与 Player 日志分离
+
+Creator 与 Player 同目录部署时会混写同一个 `sonic.log`。各自 `main()` 在首次日志写入前调用 `SonicLog::setLogFile()` 指定专属文件名：
+
+- **Creator** → `sonic_creator.log`
+- **Player** → `sonic_player.log`
+
+### 修复问题
+
+#### 日志分离后仍残留空 sonic.log（惰性创建修复）
+
+**现象**：分离后运行仍会在 exe 目录产生一个 0 字节 `sonic.log`。
+
+**根因**：`SonicLog` 构造函数调用 `setLogFile(默认 sonic.log)` 时**立即 `open()`**——`QFile::open` 一旦调用即创建文件，无论后续是否有内容写入。等 `main()` 再切换到专属文件名时，`sonic.log` 已被创建成空文件并遗弃。
+
+**修复**：打开动作从"构造/配置时"推迟到"**首次写入时**"（惰性打开）——构造函数与 `setLogFile` 只登记路径，新增 `ensureFileOpen()` 在 `write()` 写文件前才真正落盘。效果：无日志输出则零文件产生；有日志只创建实际写到的那个文件。
+
+#### 特殊上下文脚本资源断链 — status=0 残留（v2.5 窄修）
+
+**现象**：dosbox/emulator 类站点录制时，少量请求残留 `status=0` 断链记录（实测案例：64 个 Resp 200 中 4 个落网，如 `audioWorklet.addModule` 加载的 `PCMAWP20241212.js`、`tools.zip` 动态解包后二次加载的 `wdosbox-x.js`）。
+
+**根因实证**（三层验证收敛）：
+1. 排除 Content-Type 干扰（`text/javascript` 为合法 JS MIME）
+2. 浏览器 DevTools 显示此类请求 `type=Script/Other`、`initiator=Other` 且归因不到栈——worklet 模块抓取经 "queue a global task" 异步发起、调用栈早已退出，`Ctrl+Shift+F` 定位到 `audioWorklet.addModule()` 实证
+3. 归因为**特殊上下文脚本加载的 Network 域"失明"**：此类请求的 CDP Network 生命周期事件（`responseReceived`/`loadingFinished`）不投递到录制会话，而 Fetch 暂停事件可达（实测日志 `Paused stage=Resp status=200`）——事后 `Network.getResponseBody` 路径永不触发，唯一捕获窗口是 Fetch Response 暂停点
+
+**修复**：`network_recorder.cpp` Fetch Response 阶段对 `statusCode==200 && resourceType ∈ {Script, Other}` 一律走 Fetch 直抓 body（ResourceType 判定**优先于** Content-Type / Content-Length 启发式）。判定依据：CDP 枚举无 worklet 类型，worklet 模块 / 动态解包执行 / worker 主脚本等一律归为 Script 或 Other；此类资源数量少且脚本类本就要下载完才执行，暂停抓取开销可忽略。
+
+### 文档
+
+- ROADMAP 未来计划新增：
+  - **录制完整性 v2 — 全量 Fetch 严格模式（可开关，默认保守）**：当前"Fetch 启发式特判 + Network 兜底"混合路径的隐含假设（"Network 域对所有请求可靠、body 事后可补"）已被本案例证伪；失败分两类（事件到/body 取不到 vs 事件根本不到），类2只能预防性拦截。含 F12 无感机制解析、严格模式落地前置（停录归因诊断）与已知边界
+  - **录制停止后手动补录资源（查漏补缺闭环）— 方案 B 设想**：A/B 两子功能拆解（B=上传文件+指定 URL/头部的人工注入为超集且零网络依赖）、技术可行性、5 项设计坑（二次录制 / record_time 语义 / Content-Type 校验 / 策略边界 / 内容资产修订）、建议 v1 只做 B，择机决策实现
+
+---
+
 ## v0.1.9 (2026-09-01)
 
 ### 修复问题 — 分片补全链路的数据完整性与视图失真（v2.4）
